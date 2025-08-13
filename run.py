@@ -43,26 +43,58 @@ def main(_config):
         _config["per_gpu_batchsize"] * num_gpus * _config["num_nodes"]
     )
 
-    max_steps = _config["max_steps"] if _config["max_steps"] is not None else None
+    max_steps = _config["max_steps"] if _config["max_steps"] is not None else 25000
+    max_epochs = _config["max_epoch"] if _config["max_epoch"] is not None else 50
+    # trainer = pl.Trainer(
+    #     gpus=_config["num_gpus"],
+    #     num_nodes=_config["num_nodes"],
+    #     precision=_config["precision"],
+    #     accelerator="ddp",
+    #     benchmark=True,
+    #     deterministic=True,
+    #     max_epochs=_config["max_epoch"] if max_steps is None else 1000,
+    #     max_steps=max_steps,
+    #     callbacks=callbacks,
+    #     logger=logger,
+    #     prepare_data_per_node=False,
+    #     replace_sampler_ddp=False,
+    #     accumulate_grad_batches=grad_steps,
+    #     log_every_n_steps=10,
+    #     flush_logs_every_n_steps=10,
+    #     resume_from_checkpoint=_config["resume_from"],
+    #     weights_summary="top",
+    #     fast_dev_run=_config["fast_dev_run"],
+    #     val_check_interval=_config["val_check_interval"],
+    # )
 
     trainer = pl.Trainer(
-        gpus=_config["num_gpus"],
+        # ▶️ 硬件/并行策略
+        accelerator="gpu",                   # 旧写法 accelerator="ddp" → 现在写到 strategy
+        strategy="ddp",                      # 新增：并行策略放到 strategy
+        devices=_config["num_gpus"],         # 旧 gpus → 新 devices
         num_nodes=_config["num_nodes"],
+
+        # ▶️ 训练精度与性能
         precision=_config["precision"],
-        accelerator="ddp",
         benchmark=True,
         deterministic=True,
-        max_epochs=_config["max_epoch"] if max_steps is None else 1000,
+
+        # ▶️ 训练时长控制
+        max_epochs=max_epochs if max_steps is None else 1000,
         max_steps=max_steps,
-        callbacks=callbacks,
+
+        # ▶️ 记录与回调
         logger=logger,
-        prepare_data_per_node=False,
-        replace_sampler_ddp=False,
-        accumulate_grad_batches=grad_steps,
+        callbacks=callbacks,
         log_every_n_steps=10,
-        flush_logs_every_n_steps=10,
-        resume_from_checkpoint=_config["resume_from"],
-        weights_summary="top",
+
+        # ▶️ 分布式采样器
+        use_distributed_sampler=False,       # 旧 replace_sampler_ddp=False
+
+        # ▶️ 梯度累积
+        accumulate_grad_batches=grad_steps,
+
+        # ▶️ 其他常用开关
         fast_dev_run=_config["fast_dev_run"],
         val_check_interval=_config["val_check_interval"],
     )

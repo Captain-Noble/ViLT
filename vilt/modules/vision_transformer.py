@@ -641,11 +641,21 @@ class VisionTransformer(nn.Module):
                     )
                 )
 
-        select = torch.cat(select, dim=0)
-        x = x[select[:, 0], select[:, 1]].view(B, -1, C)
-        x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        # select = torch.cat(select, dim=0)
+        # x = x[select[:, 0], select[:, 1]].view(B, -1, C)
+        # x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        # # added
+        # patch_index = patch_index.to("cuda:0")
+        # patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
+        # pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
+
+        select = torch.cat(select, dim=0).to(x.device)        # 🔄 与 feature 同卡
+        x       = x      [select[:, 0], select[:, 1]].view(B, -1, C)
+        x_mask  = x_mask [select[:, 0], select[:, 1]].view(B, -1)
+        patch_index = patch_index.to(x.device)
         patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
-        pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
+        pos_embed   = pos_embed.to(x.device)
+        pos_embed   = pos_embed  [select[:, 0], select[:, 1]].view(B, -1, C)
 
         if mask_it:
             label = label[select[:, 0], select[:, 1]].view(B, -1, 3)
@@ -796,11 +806,23 @@ class DistilledVisionTransformer(VisionTransformer):
                     )
                 )
 
-        select = torch.cat(select, dim=0)
-        x = x[select[:, 0], select[:, 1]].view(B, -1, C)
-        x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        # select = torch.cat(select, dim=0)
+        # x = x[select[:, 0], select[:, 1]].view(B, -1, C)
+        # x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        # # added
+        # # patch_index = patch_index.to("cuda:0")
+
+        # patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
+        # pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
+
+        select = torch.cat(select, dim=0).to(x.device)        # 🔄 与 feature 同卡
+        x       = x      [select[:, 0], select[:, 1]].view(B, -1, C)
+        x_mask  = x_mask [select[:, 0], select[:, 1]].view(B, -1)
+        patch_index = patch_index.to(x.device)
         patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
-        pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
+        pos_embed   = pos_embed.to(x.device)
+        pos_embed   = pos_embed  [select[:, 0], select[:, 1]].view(B, -1, C)
+
         if mask_it:
             label = label[select[:, 0], select[:, 1]].view(B, -1, 3)
 

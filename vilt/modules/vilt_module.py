@@ -11,6 +11,12 @@ class ViLTransformerSS(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.save_hyperparameters()
+        # for newer version
+                # ▶️ 用于跨 batch 缓存各阶段 step 输出
+        self.test_step_outputs: list[dict] = []        # test
+        self.training_step_outputs: list[torch.Tensor] = []  # train
+        self.validation_step_outputs: list = []        # val
+        # ---------------
 
         bert_config = BertConfig(
             vocab_size=config["vocab_size"],
@@ -58,7 +64,7 @@ class ViLTransformerSS(pl.LightningModule):
             self.hparams.config["load_path"] != ""
             and not self.hparams.config["test_only"]
         ):
-            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu")
+            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu", weights_only=False)
             state_dict = ckpt["state_dict"]
             self.load_state_dict(state_dict, strict=False)
 
@@ -103,7 +109,7 @@ class ViLTransformerSS(pl.LightningModule):
         # ===================== load downstream (test_only) ======================
 
         if self.hparams.config["load_path"] != "" and self.hparams.config["test_only"]:
-            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu")
+            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu", weights_only=False)
             state_dict = ckpt["state_dict"]
             self.load_state_dict(state_dict, strict=False)
 
@@ -219,18 +225,27 @@ class ViLTransformerSS(pl.LightningModule):
         vilt_utils.set_task(self)
         output = self(batch)
         total_loss = sum([v for k, v in output.items() if "loss" in k])
-
+        self.training_step_outputs.append(total_loss.detach())
         return total_loss
-
-    def training_epoch_end(self, outs):
+    
+    # def training_epoch_end(self, outs):
+        # vilt_utils.epoch_wrapup(self)
+    # 旧：training_epoch_end → 新：on_train_epoch_end
+    def on_train_epoch_end(self):
         vilt_utils.epoch_wrapup(self)
+        self.training_step_outputs.clear()  # 释放显存
 
     def validation_step(self, batch, batch_idx):
         vilt_utils.set_task(self)
         output = self(batch)
+        self.validation_step_outputs.append(output)
 
-    def validation_epoch_end(self, outs):
+    # def validation_epoch_end(self, outs):
+    #     vilt_utils.epoch_wrapup(self)
+        # 旧：validation_epoch_end → 新：on_validation_epoch_end
+    def on_validation_epoch_end(self):
         vilt_utils.epoch_wrapup(self)
+        self.validation_step_outputs.clear()
 
     def test_step(self, batch, batch_idx):
         vilt_utils.set_task(self)
@@ -240,14 +255,30 @@ class ViLTransformerSS(pl.LightningModule):
         if self.hparams.config["loss_names"]["vqa"] > 0:
             ret.update(objectives.vqa_test_step(self, batch, output))
 
+
+        #  for newer version
+        # 记录当前 batch 的输出，供 epoch_end 聚合
+        self.test_step_outputs.append(ret)
+        # ---------------
+
         return ret
 
-    def test_epoch_end(self, outs):
-        model_name = self.hparams.config["load_path"].split("/")[-1][:-5]
+    # def test_epoch_end(self, outs):
+    #     model_name = self.hparams.config["load_path"].split("/")[-1][:-5]
 
+    #     if self.hparams.config["loss_names"]["vqa"] > 0:
+    #         objectives.vqa_test_wrapup(outs, model_name)
+    #     vilt_utils.epoch_wrapup(self)
+
+    def configure_optimizers(self):
+        return vilt_utils.set_schedule(self)
+
+    def on_test_epoch_end(self):
+        outs = self.test_step_outputs  
+
+        model_name = self.hparams.config["load_path"].split("/")[-1][:-5]
         if self.hparams.config["loss_names"]["vqa"] > 0:
             objectives.vqa_test_wrapup(outs, model_name)
         vilt_utils.epoch_wrapup(self)
 
-    def configure_optimizers(self):
-        return vilt_utils.set_schedule(self)
+        self.test_step_outputs.clear()
