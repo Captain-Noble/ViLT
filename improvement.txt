@@ -16,6 +16,7 @@ Consider using finetuning（既有分类的，又有生成的）
 
 VILT的两个Loss函数第一个是MLM第二个是图文对齐。
 MLM主要是学习分类模式的语义的，我们要替换模型结构和loss函数去学习生成式的语义（GPT）
+图文对齐中，VILT提供了一种方式，我们可以去查找OpenAI和Meta的方式。
 
 
 任务先后顺序：
