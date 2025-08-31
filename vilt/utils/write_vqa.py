@@ -49,7 +49,9 @@ def path2rest(path, split, annotations, label2ans):
     return [binary, questions, answers, answer_labels, answer_scores, iid, qids, split]
 
 
-def make_arrow(root, dataset_root):
+def make_arrow(root, dataset_root, num_limit: int = -1):
+    RAND_SEED = 123
+
     with open(f"{root}/v2_OpenEnded_mscoco_train2014_questions.json", "r") as fp:
         questions_train2014 = json.load(fp)["questions"]
     with open(f"{root}/v2_OpenEnded_mscoco_val2014_questions.json", "r") as fp:
@@ -65,27 +67,17 @@ def make_arrow(root, dataset_root):
         annotations_val2014 = json.load(fp)["annotations"]
 
     annotations = dict()
-
     for split, questions in zip(
         ["train", "val", "test", "test-dev"],
-        [
-            questions_train2014,
-            questions_val2014,
-            questions_test2015,
-            questions_test_dev2015,
-        ],
+        [questions_train2014, questions_val2014, questions_test2015, questions_test_dev2015],
     ):
         _annot = defaultdict(dict)
         for q in tqdm(questions):
             _annot[q["image_id"]][q["question_id"]] = [q["question"]]
-
         annotations[split] = _annot
 
-    all_major_answers = list()
-
-    for split, annots in zip(
-        ["train", "val"], [annotations_train2014, annotations_val2014],
-    ):
+    all_major_answers = []
+    for split, annots in zip(["train", "val"], [annotations_train2014, annotations_val2014]):
         _annot = annotations[split]
         for q in tqdm(annots):
             all_major_answers.append(q["multiple_choice_answer"])
@@ -95,9 +87,7 @@ def make_arrow(root, dataset_root):
     ans2label = {k: i for i, k in enumerate(counter.keys())}
     label2ans = list(counter.keys())
 
-    for split, annots in zip(
-        ["train", "val"], [annotations_train2014, annotations_val2014],
-    ):
+    for split, annots in zip(["train", "val"], [annotations_train2014, annotations_val2014]):
         _annot = annotations[split]
         for q in tqdm(annots):
             answers = q["answers"]
@@ -106,100 +96,64 @@ def make_arrow(root, dataset_root):
                 answer_ = answer["answer"]
                 answer_count[answer_] = answer_count.get(answer_, 0) + 1
 
-            labels = []
-            scores = []
+            labels, scores = [], []
             for answer in answer_count:
                 if answer not in ans2label:
                     continue
                 labels.append(ans2label[answer])
-                score = get_score(answer_count[answer])
-                scores.append(score)
+                scores.append(get_score(answer_count[answer]))
 
-            _annot[q["image_id"]][q["question_id"]].append(
-                {"labels": labels, "scores": scores,}
-            )
+            _annot[q["image_id"]][q["question_id"]].append({"labels": labels, "scores": scores})
 
     for split in ["train", "val"]:
-        filtered_annot = dict()
+        filtered_annot = {}
         for ik, iv in annotations[split].items():
-            new_q = dict()
-            for qk, qv in iv.items():
-                if len(qv[1]["labels"]) != 0:
-                    new_q[qk] = qv
+            new_q = {qk: qv for qk, qv in iv.items() if len(qv[1]["labels"]) != 0}
             if len(new_q) != 0:
                 filtered_annot[ik] = new_q
         annotations[split] = filtered_annot
 
-    for split in [
-        "train",
-        "val",
-        "test",
-        "test-dev",
-    ]:
-        annot = annotations[split]
-        split_name = {
-            "train": "train2014",
-            "val": "val2014",
-            "test": "test2015",
-            "test-dev": "test2015",
-        }[split]
+    for split in ["train", "val", "test", "test-dev"]:
+        split_name = {"train": "train2014", "val": "val2014", "test": "test2015", "test-dev": "test2015"}[split]
         paths = list(glob(f"{root}/{split_name}/*.jpg"))
         random.shuffle(paths)
-        annot_paths = [
-            path
-            for path in paths
-            if int(path.split("/")[-1].split("_")[-1][:-4]) in annot
-        ]
+        annot = annotations[split]
+        annot_paths = [p for p in paths if int(p.split("/")[-1].split("_")[-1][:-4]) in annot]
 
         if len(paths) == len(annot_paths):
             print("all images have caption annotations")
         else:
             print("not all images have caption annotations")
-        print(
-            len(paths), len(annot_paths), len(annot),
-        )
+        print(len(paths), len(annot_paths), len(annot))
 
-        bs = [
-            path2rest(path, split, annotations, label2ans) for path in tqdm(annot_paths)
-        ]
+        # —— 采样：在“图像级”做随机抽样
+        if num_limit is not None and num_limit > 0:
+            random.seed(RAND_SEED)
+            k = min(num_limit, len(annot_paths))
+            annot_paths = random.sample(annot_paths, k)
+            print(f"[sampling:{split}] num_limit={num_limit} -> final={len(annot_paths)}")
 
+        bs = [path2rest(p, split, annotations, label2ans) for p in tqdm(annot_paths)]
         dataframe = pd.DataFrame(
             bs,
-            columns=[
-                "image",
-                "questions",
-                "answers",
-                "answer_labels",
-                "answer_scores",
-                "image_id",
-                "question_id",
-                "split",
-            ],
+            columns=["image", "questions", "answers", "answer_labels", "answer_scores", "image_id", "question_id", "split"],
         )
-
         table = pa.Table.from_pandas(dataframe)
-
         os.makedirs(dataset_root, exist_ok=True)
         with pa.OSFile(f"{dataset_root}/vqav2_{split}.arrow", "wb") as sink:
             with pa.RecordBatchFileWriter(sink, table.schema) as writer:
                 writer.write_table(table)
 
-    table = pa.ipc.RecordBatchFileReader(
-        pa.memory_map(f"{dataset_root}/vqav2_val.arrow", "r")
-    ).read_all()
-
+    # 其余切分逻辑保持不变
+    table = pa.ipc.RecordBatchFileReader(pa.memory_map(f"{dataset_root}/vqav2_val.arrow", "r")).read_all()
     pdtable = table.to_pandas()
-
     df1 = pdtable[:-1000]
     df2 = pdtable[-1000:]
-
     df1 = pa.Table.from_pandas(df1)
     df2 = pa.Table.from_pandas(df2)
-
     with pa.OSFile(f"{dataset_root}/vqav2_trainable_val.arrow", "wb") as sink:
         with pa.RecordBatchFileWriter(sink, df1.schema) as writer:
             writer.write_table(df1)
-
     with pa.OSFile(f"{dataset_root}/vqav2_rest_val.arrow", "wb") as sink:
         with pa.RecordBatchFileWriter(sink, df2.schema) as writer:
             writer.write_table(df2)

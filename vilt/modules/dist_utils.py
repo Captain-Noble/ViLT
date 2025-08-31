@@ -110,7 +110,6 @@ def _serialize_to_tensor(data, group):
     tensor = torch.ByteTensor(storage).to(device=device)
     return tensor
 
-
 def _pad_to_largest_tensor(tensor, group):
     """
     Returns:
@@ -118,40 +117,43 @@ def _pad_to_largest_tensor(tensor, group):
         Tensor: padded tensor that has the max size
     """
     world_size = dist.get_world_size(group=group)
-    assert (
-        world_size >= 1
-    ), "comm.gather/all_gather must be called from ranks within the given group!"
-    local_size = torch.tensor([tensor.numel()], dtype=torch.int64, device=tensor.device)
-    size_list = [
-        torch.zeros([1], dtype=torch.int64, device=tensor.device)
-        for _ in range(world_size)
-    ]
-    dist.all_gather(size_list, local_size, group=group)
-    size_list = [int(size.item()) for size in size_list]
+    assert world_size >= 1, "comm.gather/all_gather must be called from ranks within the given group!"
 
+    local_size = torch.tensor([tensor.numel()], dtype=torch.int64, device=tensor.device)
+
+    # 关键：在非 InferenceMode 下创建接收张量并调用 all_gather
+    with _no_inference_mode():
+        size_list = [
+            torch.zeros([1], dtype=torch.int64, device=tensor.device)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(size_list, local_size, group=group)
+
+    size_list = [int(size.item()) for size in size_list]
     max_size = max(size_list)
 
-    # we pad the tensor because torch all_gather does not support
-    # gathering tensors of different shapes
+    # 形状不一致需要 pad
     if local_size != max_size:
         padding = torch.zeros(
             (max_size - local_size,), dtype=torch.uint8, device=tensor.device
         )
         tensor = torch.cat((tensor, padding), dim=0)
+
     return size_list, tensor
+
+
+from contextlib import nullcontext
+
+def _no_inference_mode():
+    """关闭 InferenceMode 的上下文；老版本 PyTorch 无该属性时为 no-op。"""
+    if hasattr(torch, "inference_mode"):
+        return torch.inference_mode(False)
+    return nullcontext()
 
 
 def all_gather(data, group=None):
     """
     Run all_gather on arbitrary picklable data (not necessarily tensors).
-
-    Args:
-        data: any picklable object
-        group: a torch process group. By default, will use a group which
-            contains all ranks on gloo backend.
-
-    Returns:
-        list[data]: list of data gathered from each rank
     """
     if get_world_size() == 1:
         return [data]
@@ -165,34 +167,34 @@ def all_gather(data, group=None):
     size_list, tensor = _pad_to_largest_tensor(tensor, group)
     max_size = max(size_list)
 
-    # receiving Tensor from all ranks
-    tensor_list = [
-        torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
-        for _ in size_list
-    ]
-    dist.all_gather(tensor_list, tensor, group=group)
+    # 接收缓冲要在非 InferenceMode 下创建，否则是“推理张量”
+    with _no_inference_mode():
+        # tensor_list = [
+        #     torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
+        #     for _ in size_list
+        # ]
+        # # 关键：通信本身也放在非 InferenceMode 下
+        # dist.all_gather(tensor_list, tensor, group=group)
+
+                # 例：在 all_gather 里
+        tensor_list = [
+            torch.empty((max_size,), dtype=torch.uint8, device=tensor.device).clone()
+            for _ in size_list
+        ]
+        dist.all_gather(tensor_list, tensor, group=group)
+
 
     data_list = []
-    for size, tensor in zip(size_list, tensor_list):
-        buffer = tensor.cpu().numpy().tobytes()[:size]
+    for size, ten in zip(size_list, tensor_list):
+        buffer = ten.cpu().numpy().tobytes()[:size]
         data_list.append(pickle.loads(buffer))
-
     return data_list
+
 
 
 def gather(data, dst=0, group=None):
     """
     Run gather on arbitrary picklable data (not necessarily tensors).
-
-    Args:
-        data: any picklable object
-        dst (int): destination rank
-        group: a torch process group. By default, will use a group which
-            contains all ranks on gloo backend.
-
-    Returns:
-        list[data]: on dst, a list of data gathered from each rank. Otherwise,
-            an empty list.
     """
     if get_world_size() == 1:
         return [data]
@@ -200,27 +202,36 @@ def gather(data, dst=0, group=None):
         group = _get_global_gloo_group()
     if dist.get_world_size(group=group) == 1:
         return [data]
+
     rank = dist.get_rank(group=group)
 
     tensor = _serialize_to_tensor(data, group)
     size_list, tensor = _pad_to_largest_tensor(tensor, group)
 
-    # receiving Tensor from all ranks
     if rank == dst:
         max_size = max(size_list)
-        tensor_list = [
-            torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
-            for _ in size_list
-        ]
-        dist.gather(tensor, tensor_list, dst=dst, group=group)
+        with _no_inference_mode():
+            # tensor_list = [
+            #     torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
+            #     for _ in size_list
+            # ]
+            # dist.gather(tensor, tensor_list, dst=dst, group=group)
+            # 例：在 all_gather 里
+            tensor_list = [
+                torch.empty((max_size,), dtype=torch.uint8, device=tensor.device).clone()
+                for _ in size_list
+            ]
+            dist.all_gather(tensor_list, tensor, group=group)
+
 
         data_list = []
-        for size, tensor in zip(size_list, tensor_list):
-            buffer = tensor.cpu().numpy().tobytes()[:size]
+        for size, ten in zip(size_list, tensor_list):
+            buffer = ten.cpu().numpy().tobytes()[:size]
             data_list.append(pickle.loads(buffer))
         return data_list
     else:
-        dist.gather(tensor, [], dst=dst, group=group)
+        with _no_inference_mode():
+            dist.gather(tensor, [], dst=dst, group=group)
         return []
 
 

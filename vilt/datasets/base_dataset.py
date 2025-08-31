@@ -21,13 +21,16 @@ class BaseDataset(torch.utils.data.Dataset):
         draw_false_image=0,
         draw_false_text=0,
         image_only=False,
+        max_num=None,   # 🔹 新增参数
     ):
         """
         data_dir : where dataset file *.arrow lives; existence should be guaranteed via DataModule.prepare_data
         transform_keys : keys for generating augmented views of images
         text_column_name : pyarrow table column name that has list of strings as elements
+        max_num : if not None, limit number of loaded samples
         """
         assert len(transform_keys) >= 1
+        # max_num = 256
         super().__init__()
 
         self.transforms = keys_to_transforms(transform_keys, size=image_size)
@@ -38,6 +41,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.draw_false_text = draw_false_text
         self.image_only = image_only
         self.data_dir = data_dir
+        self.max_num = max_num   # 🔹 保存参数
 
         if len(names) != 0:
             tables = [
@@ -50,9 +54,17 @@ class BaseDataset(torch.utils.data.Dataset):
 
             self.table_names = list()
             for i, name in enumerate(names):
+                if i >= len(tables):
+                    break
                 self.table_names += [name] * len(tables[i])
 
             self.table = pa.concat_tables(tables, promote=True)
+
+            # 🔹 如果 max_num 不为 None，裁剪 table
+            if self.max_num is not None and len(self.table) > self.max_num:
+                self.table = self.table.slice(0, self.max_num)
+                self.table_names = self.table_names[: self.max_num]
+
             if text_column_name != "":
                 self.text_column_name = text_column_name
                 self.all_texts = self.table[text_column_name].to_pandas().tolist()

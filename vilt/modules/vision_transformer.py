@@ -33,7 +33,10 @@ from functools import partial
 from tqdm import tqdm
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.helpers import load_pretrained
+try:
+    from timm.models.helpers import load_pretrained as timm_load_pretrained  # 旧版 timm
+except Exception:
+    from timm.models._builder import load_pretrained as timm_load_pretrained  # 新版 timm
 from timm.models.layers import StdConv2dSame, DropPath, to_2tuple, trunc_normal_
 from timm.models.resnet import resnet26d, resnet50d
 from timm.models.resnetv2 import ResNetV2
@@ -930,7 +933,9 @@ def _create_vision_transformer(variant, pretrained=False, distilled=False, **kwa
     model.default_cfg = default_cfg
 
     if pretrained:
-        load_pretrained(
+        if not hasattr(model, "pretrained_cfg") and hasattr(model, "default_cfg"):
+            model.pretrained_cfg = model.default_cfg
+        timm_load_pretrained(
             model,
             num_classes=num_classes,
             in_chans=kwargs.get("in_chans", 3),

@@ -94,7 +94,8 @@ def env_dandelin():
 @ex.named_config
 def task_mlm_itm():
     exp_name = "mlm_itm"
-    datasets = ["coco", "vg", "sbu", "gcc"]
+    # datasets = ["coco", "vg", "sbu", "gcc"]
+    datasets = ["coco", "vg"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
     batch_size = 4096
     max_epoch = 10
@@ -104,7 +105,8 @@ def task_mlm_itm():
 @ex.named_config
 def task_mlm_itm_randaug():
     exp_name = "mlm_itm_randaug"
-    datasets = ["coco", "vg", "sbu", "gcc"]
+    # datasets = ["coco", "vg", "sbu", "gcc"]
+    datasets = ["coco", "vg"]
     train_transform_keys = ["pixelbert_randaug"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
     batch_size = 4096
@@ -239,6 +241,11 @@ def task_finetune_irtr_f30k_randaug():
 
 
 # Named configs for "etc" which are orthogonal to "env" and "task", need to be added at the end
+
+@ex.named_config
+def steptest():
+    max_epoch = 100
+    max_steps = 100
 
 
 @ex.named_config
