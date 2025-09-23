@@ -170,37 +170,27 @@ class BaseDataset(torch.utils.data.Dataset):
                 print(f"Error while read file idx {index} in {self.names[0]} -> {e}")
                 index = random.randint(0, len(self.index_mapper) - 1)
         return ret
-
+    
     def collate(self, batch, mlm_collator):
         batch_size = len(batch)
         keys = set([key for b in batch for key in b.keys()])
         dict_batch = {k: [dic[k] if k in dic else None for dic in batch] for k in keys}
 
+        # ======== 图像对齐（保持不变） ========
         img_keys = [k for k in list(dict_batch.keys()) if "image" in k]
         img_sizes = list()
-
         for img_key in img_keys:
             img = dict_batch[img_key]
             img_sizes += [ii.shape for i in img if i is not None for ii in i]
-
         for size in img_sizes:
-            assert (
-                len(size) == 3
-            ), f"Collate error, an image should be in shape of (3, H, W), instead of given {size}"
-
+            assert len(size) == 3, f"..."
         if len(img_keys) != 0:
             max_height = max([i[1] for i in img_sizes])
             max_width = max([i[2] for i in img_sizes])
-
         for img_key in img_keys:
             img = dict_batch[img_key]
             view_size = len(img[0])
-
-            new_images = [
-                torch.zeros(batch_size, 3, max_height, max_width)
-                for _ in range(view_size)
-            ]
-
+            new_images = [torch.zeros(batch_size, 3, max_height, max_width) for _ in range(view_size)]
             for bi in range(batch_size):
                 orig_batch = img[bi]
                 for vi in range(view_size):
@@ -209,44 +199,65 @@ class BaseDataset(torch.utils.data.Dataset):
                     else:
                         orig = img[bi][vi]
                         new_images[vi][bi, :, : orig.shape[1], : orig.shape[2]] = orig
-
             dict_batch[img_key] = new_images
 
+        # ======== 文本对齐（新增：AR-LM 分支） ========
         txt_keys = [k for k in list(dict_batch.keys()) if "text" in k]
-
         if len(txt_keys) != 0:
+            # 收集原始文本与 tokenizer 编码
             texts = [[d[0] for d in dict_batch[txt_key]] for txt_key in txt_keys]
             encodings = [[d[1] for d in dict_batch[txt_key]] for txt_key in txt_keys]
-            draw_text_len = len(encodings)
-            flatten_encodings = [e for encoding in encodings for e in encoding]
-            flatten_mlms = mlm_collator(flatten_encodings)
 
-            for i, txt_key in enumerate(txt_keys):
-                texts, encodings = (
-                    [d[0] for d in dict_batch[txt_key]],
-                    [d[1] for d in dict_batch[txt_key]],
-                )
+            if mlm_collator is not None:
+                # ---------- 原 MLM 路径（保持现状） ----------
+                flatten_encodings = [e for encoding in encodings for e in encoding]
+                flatten_mlms = mlm_collator(flatten_encodings)
 
-                mlm_ids, mlm_labels = (
-                    flatten_mlms["input_ids"][batch_size * (i) : batch_size * (i + 1)],
-                    flatten_mlms["labels"][batch_size * (i) : batch_size * (i + 1)],
-                )
-
-                input_ids = torch.zeros_like(mlm_ids)
-                attention_mask = torch.zeros_like(mlm_ids)
-                for _i, encoding in enumerate(encodings):
-                    _input_ids, _attention_mask = (
-                        torch.tensor(encoding["input_ids"]),
-                        torch.tensor(encoding["attention_mask"]),
+                for i, txt_key in enumerate(txt_keys):
+                    texts_i, encodings_i = (
+                        [d[0] for d in dict_batch[txt_key]],
+                        [d[1] for d in dict_batch[txt_key]],
                     )
-                    input_ids[_i, : len(_input_ids)] = _input_ids
-                    attention_mask[_i, : len(_attention_mask)] = _attention_mask
+                    mlm_ids = flatten_mlms["input_ids"][batch_size * i : batch_size * (i + 1)]
+                    mlm_labels = flatten_mlms["labels"][batch_size * i : batch_size * (i + 1)]
 
-                dict_batch[txt_key] = texts
-                dict_batch[f"{txt_key}_ids"] = input_ids
-                dict_batch[f"{txt_key}_labels"] = torch.full_like(input_ids, -100)
-                dict_batch[f"{txt_key}_ids_mlm"] = mlm_ids
-                dict_batch[f"{txt_key}_labels_mlm"] = mlm_labels
-                dict_batch[f"{txt_key}_masks"] = attention_mask
+                    input_ids = torch.zeros_like(mlm_ids)
+                    attention_mask = torch.zeros_like(mlm_ids)
+                    for _i, encoding in enumerate(encodings_i):
+                        _input_ids  = torch.tensor(encoding["input_ids"])
+                        _attn_mask  = torch.tensor(encoding["attention_mask"])
+                        input_ids[_i, : len(_input_ids)] = _input_ids
+                        attention_mask[_i, : len(_attn_mask)] = _attn_mask
+
+                    dict_batch[txt_key] = texts_i
+                    dict_batch[f"{txt_key}_ids"] = input_ids
+                    dict_batch[f"{txt_key}_labels"] = torch.full_like(input_ids, -100)
+                    dict_batch[f"{txt_key}_ids_mlm"] = mlm_ids
+                    dict_batch[f"{txt_key}_labels_mlm"] = mlm_labels
+                    dict_batch[f"{txt_key}_masks"] = attention_mask
+            else:
+                # ---------- GPT/AR-LM 路径（新增） ----------
+                for i, txt_key in enumerate(txt_keys):
+                    texts_i, encodings_i = (
+                        [d[0] for d in dict_batch[txt_key]],
+                        [d[1] for d in dict_batch[txt_key]],
+                    )
+                    # 先找出该批最大长度，或直接用 tokenizer 的 padding 长度
+                    max_len = max(len(e["input_ids"]) for e in encodings_i)
+                    input_ids = torch.zeros((batch_size, max_len), dtype=torch.long)
+                    attention_mask = torch.zeros_like(input_ids)
+
+                    for _i, encoding in enumerate(encodings_i):
+                        _input_ids = torch.tensor(encoding["input_ids"], dtype=torch.long)
+                        _attn_mask = torch.tensor(encoding["attention_mask"], dtype=torch.long)
+                        input_ids[_i, : len(_input_ids)] = _input_ids
+                        attention_mask[_i, : len(_attn_mask)] = _attn_mask
+
+                    dict_batch[txt_key] = texts_i
+                    dict_batch[f"{txt_key}_ids"] = input_ids
+                    dict_batch[f"{txt_key}_masks"] = attention_mask
+                    # GPT 的标签在 objectives.compute_ar_lm 里用 shift-one 现算，
+                    # 这里给一个占位（全部 -100）供其他分支兼容
+                    dict_batch[f"{txt_key}_labels"] = torch.full_like(input_ids, -100)
 
         return dict_batch

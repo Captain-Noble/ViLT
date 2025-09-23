@@ -1,10 +1,16 @@
 import os
+
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
 import copy
 import pytorch_lightning as pl
 
 from vilt.config import ex
 from vilt.modules import ViLTransformerSS
 from vilt.datamodules.multitask_datamodule import MTDataModule
+from pytorch_lightning.strategies import DDPStrategy
+
 
 
 @ex.automain
@@ -70,7 +76,9 @@ def main(_config):
     trainer = pl.Trainer(
         # ▶️ 硬件/并行策略
         accelerator="gpu",                   # 旧写法 accelerator="ddp" → 现在写到 strategy
-        strategy="ddp",                      # 新增：并行策略放到 strategy
+        # strategy="ddp",                      # 新增：并行策略放到 strategy
+        
+        strategy=DDPStrategy(find_unused_parameters=True),
         devices=_config["num_gpus"],         # 旧 gpus → 新 devices
         num_nodes=_config["num_nodes"],
 
@@ -97,6 +105,11 @@ def main(_config):
         # ▶️ 其他常用开关
         fast_dev_run=_config["fast_dev_run"],
         val_check_interval=_config["val_check_interval"],
+        # ← 从配置读取
+        limit_train_batches=_config.get("limit_train_batches", 1.0),
+        limit_val_batches=_config.get("limit_val_batches", 1.0),
+        limit_test_batches=_config.get("limit_test_batches", 1.0),
+
     )
 
     if not _config["test_only"]:

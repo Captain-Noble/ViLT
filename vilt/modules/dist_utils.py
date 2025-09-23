@@ -234,7 +234,6 @@ def gather(data, dst=0, group=None):
             dist.gather(tensor, [], dst=dst, group=group)
         return []
 
-
 def shared_random_seed():
     """
     Returns:

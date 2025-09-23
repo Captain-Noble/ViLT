@@ -115,6 +115,117 @@ def compute_mlm(pl_module, batch):
 
     return ret
 
+# 在文件中其它 compute_* 函数后面，新增：
+def compute_ar_lm(pl_module, batch):
+    # 走因果注意力（文本不能看未来文本，但能看所有图像 token）
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False, causal_lm=True)
+
+    lm_logits = pl_module.lm_score(infer["text_feats"])  # [B, T, V]
+    input_ids = infer["text_ids"]                        # [B, T]
+    attn_mask = infer["text_masks"]                      # [B, T], 1=valid, 0=pad
+
+    # 构造 shift-left 标签：预测 t 位置的下一个 token
+    labels = torch.full_like(input_ids, -100)            # 先全部忽略
+    # 只有当“下一位”为有效 token 时，当前位才有监督
+    next_valid = attn_mask[:, 1:].bool()
+    labels[:, :-1] = torch.where(
+        next_valid, input_ids[:, 1:], torch.full_like(input_ids[:, :-1], -100)
+    )
+    # 最后一位必须忽略（没有“下一个 token”）
+    labels[:, -1] = -100
+
+    vocab_size = pl_module.hparams.config["vocab_size"]
+    ar_loss = F.cross_entropy(
+        lm_logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+    ret = {
+        "ar_lm_loss": ar_loss,
+        "ar_lm_logits": lm_logits,
+        "ar_lm_labels": labels,
+    }
+
+    phase = "train" if pl_module.training else "val"
+    loss = getattr(pl_module, f"{phase}_ar_lm_loss")(ar_loss)
+    acc  = getattr(pl_module, f"{phase}_ar_lm_accuracy")(lm_logits, labels)
+    pl_module.log(f"ar_lm/{phase}/loss", loss)
+    pl_module.log(f"ar_lm/{phase}/accuracy", acc)
+
+    return ret
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+def _gather_no_grad(x: torch.Tensor):
+    """分布式下把各卡的特征拼起来（无梯度版本）；单卡则直接返回。"""
+    if dist.is_available() and dist.is_initialized():
+        ws = dist.get_world_size()
+        xs = [torch.zeros_like(x) for _ in range(ws)]
+        dist.all_gather(xs, x.detach())
+        xs[dist.get_rank()] = x.detach()  # 保持本rank的一致
+        return torch.cat(xs, dim=0)
+    return x
+
+def compute_itc(pl_module, batch):
+    """
+    CLIP式对比对齐（InfoNCE，对称：t->i 与 i->t）
+    文本全局向量：text_feats[:,0]（BERT的[CLS]）
+    图像全局向量：image_feats[:,0]（ViT的image [CLS]）
+    """
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+    t_cls = infer["text_feats"][:, 0, :]    # [B, H]
+    v_cls = infer["image_feats"][:, 0, :]   # [B, H]
+
+    # 投影并L2归一化
+    t = F.normalize(pl_module.text_proj(t_cls), dim=-1)   # [B, D]
+    v = F.normalize(pl_module.image_proj(v_cls), dim=-1)  # [B, D]
+
+    # （可选）分布式拼接负样本池（无梯度版）
+    t_all = _gather_no_grad(t)
+    v_all = _gather_no_grad(v)
+
+    # CLIP温度；建议做个安全夹取，防止爆炸
+    with torch.no_grad():
+        lo, hi = math.log(1/100.0), math.log(100.0)
+        pl_module.logit_scale.data.clamp_(lo, hi)
+    logit_scale = pl_module.logit_scale.exp()
+
+    # 相似度矩阵
+    logits_t2i = logit_scale * (t @ v_all.t())  # [B, B*ws]
+    logits_i2t = logit_scale * (v @ t_all.t())
+
+    # 正样本位置：本rank内样本的 index 需要加 rank 偏移
+    B = t.size(0)
+    device = t.device
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    labels = torch.arange(B, device=device) + rank * B  # [B]
+
+    # 对称交叉熵
+    loss_t = F.cross_entropy(logits_t2i, labels)
+    loss_i = F.cross_entropy(logits_i2t, labels)
+    itc_loss = 0.5 * (loss_t + loss_i)
+
+    ret = {"itc_loss": itc_loss}
+
+    phase = "train" if pl_module.training else "val"
+    # 训练时的度量：把 t->i 当作主 accuracy，便于 epoch 聚合；同时额外记录 i->t
+    acc_obj = getattr(pl_module, f"{phase}_itc_accuracy")
+    loss_obj = getattr(pl_module, f"{phase}_itc_loss")
+    acc_t = (logits_t2i.argmax(dim=1) == labels).float().mean()
+    acc_i = (logits_i2t.argmax(dim=1) == labels).float().mean()
+    # 更新聚合器（主要是t->i）
+    acc_obj(logits_t2i, labels)
+    loss_obj(itc_loss)
+    # 立即记录两个方向
+    pl_module.log(f"itc/{phase}/loss", itc_loss)
+    pl_module.log(f"itc/{phase}/t2i_acc", acc_t)
+    pl_module.log(f"itc/{phase}/i2t_acc", acc_i)
+
+    return ret
 
 def compute_mpp(pl_module, batch):
     infer = pl_module.infer(batch, mask_text=False, mask_image=True)

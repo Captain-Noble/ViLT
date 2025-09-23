@@ -316,16 +316,19 @@ class Attention(nn.Module):
             .reshape(B, N, 3, self.num_heads, C // self.num_heads)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = (
-            qkv[0],
-            qkv[1],
-            qkv[2],
-        )  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if mask is not None:
-            mask = mask.bool()
-            attn = attn.masked_fill(~mask[:, None, None, :], float("-inf"))
+            # 兼容两种 mask：
+            # - [B, Lk]：key 有效位
+            # - [B, 1, Lq, Lk]：成对注意力（例如 AR 因果掩码 + pad）
+            if mask.dim() == 2:
+                attn = attn.masked_fill(~mask[:, None, None, :].bool(), float("-inf"))
+            elif mask.dim() == 4:
+                attn = attn.masked_fill(~mask.bool(), float("-inf"))
+            else:
+                raise ValueError(f"Unsupported mask shape: {mask.shape}")
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -333,6 +336,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
+
 
 
 class Block(nn.Module):

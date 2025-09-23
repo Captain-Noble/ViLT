@@ -11,9 +11,12 @@ def _loss_names(d):
         "vqa": 0,
         "nlvr2": 0,
         "irtr": 0,
+        "ar_lm": 0,
+        "itc": 0,              # ← 新增：CLIP式对比对齐
     }
     ret.update(d)
     return ret
+
 
 
 @ex.config
@@ -80,14 +83,18 @@ def config():
     num_workers = 8
     precision = 16
 
+    # === CLIP/ITC 相关（新增） ===
+    proj_dim = 256            # 文本/图像投影后的对比空间维度
+    logit_scale_init = 1/0.07 # CLIP 默认温度的倒数
+    # GPT/AR 训练的额外开关（新增）
+    ar_causal_mask = True     # 是否使用因果注意力
+    use_bos_eos = True        # 文本是否加 BOS/EOS（用 BERT 的 [CLS]/[SEP] 也可）
+    tie_lm_head = True        # 是否与词嵌入权重 tying
+    # ============================
+    limit_train_batches = 1.0   # float: 比例(0~1); int: 批次数
+    limit_val_batches   = 1.0
+    limit_test_batches  = 1.0
 
-# Named configs for "environment" which define gpus and nodes, and paths
-@ex.named_config
-def env_dandelin():
-    data_root = "/data2/dsets/dataset"
-    log_dir = "/data2/vilt/result"
-    num_gpus = 8
-    num_nodes = 1
 
 
 # Named configs for "task" which define datasets, loss_names and desired batch_size, warmup_steps, epochs, and exp_name
@@ -97,6 +104,24 @@ def task_mlm_itm():
     # datasets = ["coco", "vg", "sbu", "gcc"]
     datasets = ["coco", "vg"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
+    batch_size = 4096
+    max_epoch = 10
+    max_image_len = 200
+
+@ex.named_config
+def task_ar_lm_itm():
+    exp_name = "ar_lm_itm"
+    datasets = ["coco", "vg"]
+    loss_names = _loss_names({"ar_lm": 1, "itm": 1})  # ← 用 AR-LM 替代 MLM
+    batch_size = 4096
+    max_epoch = 10
+    max_image_len = 200
+
+@ex.named_config
+def task_ar_lm_itc():
+    exp_name = "ar_lm_itc"
+    datasets = ["coco", "vg"]
+    loss_names = _loss_names({"ar_lm": 1, "itc": 1})  # ← ITC 取代 ITM
     batch_size = 4096
     max_epoch = 10
     max_image_len = 200
@@ -279,3 +304,5 @@ def vit32_base():
     hidden_size = 768
     num_heads = 12
     num_layers = 12
+
+

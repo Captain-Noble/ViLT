@@ -53,16 +53,34 @@ class BaseDataModule(LightningDataModule):
         self.tokenizer = get_pretrained_tokenizer(tokenizer)
         self.vocab_size = self.tokenizer.vocab_size
 
-        collator = (
-            DataCollatorForWholeWordMask
-            if _config["whole_word_masking"]
-            else DataCollatorForLanguageModeling
-        )
+        # ← 新增：是否启用 AR-LM（GPT）而非 MLM
+        self.is_ar_lm = _config["loss_names"].get("ar_lm", 0) > 0
 
-        self.mlm_collator = collator(
-            tokenizer=self.tokenizer, mlm=True, mlm_probability=_config["mlm_prob"]
-        )
+                # 仅在“非 AR-LM”时才需要 MLM collator
+        if not self.is_ar_lm:
+            collator = (
+                DataCollatorForWholeWordMask
+                if _config["whole_word_masking"]
+                else DataCollatorForLanguageModeling
+            )
+            self.mlm_collator = collator(
+                tokenizer=self.tokenizer, mlm=True, mlm_probability=_config["mlm_prob"]
+            )
+        else:
+            self.mlm_collator = None   # GPT 模式：禁用 MLM collator
         self.setup_flag = False
+
+
+        # collator = (
+        #     DataCollatorForWholeWordMask
+        #     if _config["whole_word_masking"]
+        #     else DataCollatorForLanguageModeling
+        # )
+
+        # self.mlm_collator = collator(
+        #     tokenizer=self.tokenizer, mlm=True, mlm_probability=_config["mlm_prob"]
+        # )
+        # self.setup_flag = False
 
     @property
     def dataset_cls(self):
