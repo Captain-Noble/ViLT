@@ -552,6 +552,118 @@ def compute_irtr(pl_module, batch):
     return ret
 
 
+
+# ---------- 这里开始是新的实现：与 compute_ar_lm 的风格对齐 ----------
+
+def _compute_gen_lm(pl_module, batch, task_prefix: str, image_embeds=None, image_masks=None):
+    """
+    统一的生成式 loss 计算：
+      - 期望 batch 含有 gen_input_ids/masks 与 gen_target_ids/masks
+      - 将 input 与 target 在 seq 维拼接；仅对 target 段进行 AR 监督
+      - 因果注意力（文本不可看未来文本，均可看图像 token）
+    """
+    inp_ids  = batch["gen_input_ids"]      # [B, Linp]
+    inp_mask = batch["gen_input_masks"]    # [B, Linp]
+    tgt_ids  = batch["gen_target_ids"]     # [B, Ltgt]
+    tgt_mask = batch["gen_target_masks"]   # [B, Ltgt]
+
+    B, Linp = inp_ids.size(0), inp_ids.size(1)
+    Ltgt    = tgt_ids.size(1)
+
+    # 拼接
+    text_ids   = torch.cat([inp_ids,  tgt_ids],  dim=1)     # [B, L]
+    text_masks = torch.cat([inp_mask, tgt_mask], dim=1)     # [B, L]
+    start_idx  = Linp
+
+    # === 关键修复：裁到 BERT 的 max_position_embeddings（即 config["max_text_len"]） ===
+    max_len = int(pl_module.hparams.config.get("max_text_len", text_ids.size(1)))
+    L = text_ids.size(1)
+    if L > max_len:
+        cut = L - max_len                    # 需要从左边裁掉的 token 数
+        # 仅保留最后 max_len 个 token（优先保住答案段）
+        text_ids   = text_ids[:, -max_len:]
+        text_masks = text_masks[:, -max_len:]
+        # 起点随左裁移动
+        start_idx = max(0, start_idx - cut)
+
+    # 前向（因果注意力）
+    infer = pl_module.infer(
+        {
+            "text_ids": text_ids,
+            "text_masks": text_masks,
+            # 这里 text_labels 只做占位，不参与 loss；真正监督在下方构造
+            "text_labels": text_ids,
+        },
+        mask_text=False,
+        mask_image=False,
+        causal_lm=True,
+        image_embeds=image_embeds,
+        image_masks=image_masks,
+    )
+
+    lm_logits = pl_module.lm_score(infer["text_feats"])  # [B, Lc, V]  (Lc<=max_len)
+    labels    = _shifted_labels_for_gen(text_ids, text_masks, start_idx=start_idx)
+
+    vocab_size = pl_module.hparams.config["vocab_size"]
+    gen_loss = F.cross_entropy(
+        lm_logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+    # （可选）token-level acc（仅在 labels!=-100）
+    with torch.no_grad():
+        pred = lm_logits.argmax(dim=-1)
+        mask = labels.ne(-100)
+        correct = (pred.eq(labels) & mask).sum()
+        total   = mask.sum().clamp(min=1)
+        acc_val = (correct.float() / total.float()).detach()
+
+    ret = {
+        f"{task_prefix}_loss": gen_loss,
+        f"{task_prefix}_logits": lm_logits,
+        f"{task_prefix}_labels": labels,
+    }
+
+    phase = "train" if pl_module.training else "val"
+    loss_meter = getattr(pl_module, f"{phase}_{task_prefix}_loss")(gen_loss)
+    pl_module.log(f"{task_prefix}/{phase}/loss", loss_meter)
+
+    acc_attr = f"{phase}_{task_prefix}_accuracy"
+    if hasattr(pl_module, acc_attr):
+        acc_meter = getattr(pl_module, acc_attr)(lm_logits, labels)
+        pl_module.log(f"{task_prefix}/{phase}/accuracy", acc_meter)
+    else:
+        pl_module.log(f"{task_prefix}/{phase}/accuracy", acc_val)
+
+    return ret
+
+def compute_vqa_gen(pl_module, batch):
+    """
+    生成式 VQA：需要 batch 提供
+      - gen_input_ids/masks: 形如 "question: ... answer:"
+      - gen_target_ids/masks: 形如 "yes"/"no"/短文本答案
+    """
+    return _compute_gen_lm(pl_module, batch, task_prefix="vqa_gen")
+
+def compute_nlvr2_gen(pl_module, batch):
+    """
+    生成式 NLVR2：
+      - 同样需要 gen_input_* / gen_target_*
+      - 若 batch 同时含 image_0 / image_1，则在 token 维拼接双图后送入 infer
+    """
+    ie, im = _maybe_pack_two_images(pl_module, batch)
+    return _compute_gen_lm(pl_module, batch, task_prefix="nlvr2_gen",
+                           image_embeds=ie, image_masks=im)
+
+def compute_imgcls_gen(pl_module, batch):
+    """
+    图像分类转生成：
+      - gen_input_* 可为 "classify: <image> label:"
+      - gen_target_* 为类别名文本（如 "cat", "dog"...）
+    """
+    return _compute_gen_lm(pl_module, batch, task_prefix="imgcls_gen")
+
 @torch.no_grad()
 def compute_irtr_recall(pl_module):
     text_dset = pl_module.trainer.datamodule.dms[0].make_no_false_val_dset()
@@ -761,3 +873,33 @@ def arc_test_wrapup(outs, caplen, model_name):
 
     torch.distributed.barrier()
     os.remove(f"coco_cap_len{caplen}_{rank}.json")
+
+
+def _shifted_labels_for_gen(text_ids, attn_mask, start_idx):
+    """
+    仅对 [start_idx, L) 这段（答案区）做 AR 监督：预测每个 token 的下一个；其余置 -100。
+    """
+    labels = torch.full_like(text_ids, -100)
+    valid_next = attn_mask[:, 1:].bool()
+    labels[:, start_idx:-1] = torch.where(
+        valid_next[:, start_idx:], text_ids[:, start_idx+1:], torch.full_like(text_ids[:, start_idx:-1], -100)
+    )
+    labels[:, -1] = -100
+    return labels
+
+def _maybe_pack_two_images(pl_module, batch):
+    """
+    若 batch 含 image_0 / image_1，则把两张图各自 visual_embed 后在 token 维度拼接，
+    返回 (image_embeds, image_masks)。否则返回 (None, None)。
+    注意：token_type_embed 将统一用一个 idx（infer 内部会加），这点对生成影响很小。
+    """
+    if ("image_0" in batch) and ("image_1" in batch):
+        img0 = batch["image_0"][0]; img1 = batch["image_1"][0]
+        ie0, im0, _, _ = pl_module.transformer.visual_embed(
+            img0, max_image_len=pl_module.hparams.config["max_image_len"], mask_it=False
+        )
+        ie1, im1, _, _ = pl_module.transformer.visual_embed(
+            img1, max_image_len=pl_module.hparams.config["max_image_len"], mask_it=False
+        )
+        return torch.cat([ie0, ie1], dim=1), torch.cat([im0, im1], dim=1)
+    return None, None

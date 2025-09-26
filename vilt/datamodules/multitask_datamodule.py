@@ -38,8 +38,11 @@ class MTDataModule(LightningDataModule):
         self.test_dataset = ConcatDataset([dm.test_dataset for dm in self.dms])
         self.tokenizer = self.dms[0].tokenizer
 
+        # 继续沿用“使用第一个数据集的 collate”
+        # 该 collate 在 VQAv2/NLVR2 中已向后兼容其它数据源（取不到生成字段就置空）
         self.collate = functools.partial(
-            self.dms[0].train_dataset.collate, mlm_collator=self.dms[0].mlm_collator,
+            self.dms[0].train_dataset.collate,
+            mlm_collator=self.dms[0].mlm_collator,
         )
 
         if self.dist:

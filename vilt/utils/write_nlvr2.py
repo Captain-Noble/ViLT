@@ -5,6 +5,7 @@ import os
 
 from tqdm import tqdm
 from collections import defaultdict
+import random
 
 
 def process(root, iden, row):

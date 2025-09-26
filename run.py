@@ -24,13 +24,16 @@ def main(_config):
     exp_name = f'{_config["exp_name"]}'
 
     os.makedirs(_config["log_dir"], exist_ok=True)
+    
+    monitor_key = "val/the_metric"
+    monitor_mode = "max"
+    # 如果只跑 gen 任务且你想更稳妥，也可换成：
+    # monitor_key = "nlvr2_gen/val/loss_epoch"  # 或 "vqa_gen/val/loss_epoch"
+    # monitor_mode = "min"
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=1,
-        verbose=True,
-        monitor="val/the_metric",
-        mode="max",
-        save_last=True,
+        save_top_k=1, verbose=True, monitor=monitor_key, mode=monitor_mode, save_last=True
     )
+
     logger = pl.loggers.TensorBoardLogger(
         _config["log_dir"],
         name=f'{exp_name}_seed{_config["seed"]}_from_{_config["load_path"].split("/")[-1][:-5]}',

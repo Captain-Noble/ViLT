@@ -11,13 +11,14 @@ class ViLTransformerSS(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.save_hyperparameters()
-        # for newer version
-                # ▶️ 用于跨 batch 缓存各阶段 step 输出
-        self.test_step_outputs: list[dict] = []        # test
+
+        # ▶️ 缓存各阶段 step 输出（PyTorch Lightning 新版风格）
+        self.test_step_outputs: list[dict] = []        # test.
+        0
         self.training_step_outputs: list[torch.Tensor] = []  # train
         self.validation_step_outputs: list = []        # val
-        # ---------------
 
+        # ----------------- BERT 文本侧配置 -----------------
         bert_config = BertConfig(
             vocab_size=config["vocab_size"],
             hidden_size=config["hidden_size"],
@@ -35,22 +36,32 @@ class ViLTransformerSS(pl.LightningModule):
         self.token_type_embeddings = nn.Embedding(2, config["hidden_size"])
         self.token_type_embeddings.apply(objectives.init_weights)
 
-        if self.hparams.config["load_path"] == "":
-            self.transformer = getattr(vit, self.hparams.config["vit"])(
-                pretrained=True, config=self.hparams.config
-            )
-        else:
-            self.transformer = getattr(vit, self.hparams.config["vit"])(
-                pretrained=False, config=self.hparams.config
-            )
+        self.transformer = getattr(vit, self.hparams.config["vit"])(
+            pretrained=False, config=self.hparams.config
+        )
 
+        # ----------------- 加载预训练权重（如有） -----------------
+        if self.hparams.config["load_path"] != "" and (not self.hparams.config["test_only"]):
+            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu", weights_only=False)
+            state_dict = ckpt["state_dict"]
+            # ★ 在加载之前，处理 BERT 的 position_* 维度不一致问题
+            self._patch_state_dict_for_bert_pos(state_dict)
+            self.load_state_dict(state_dict, strict=False)
+        
+        
         self.pooler = heads.Pooler(config["hidden_size"])
         self.pooler.apply(objectives.init_weights)
 
-
-        # ✅ 提前定义 hs，后面 ProjectionHead 要用
         hs = self.hparams.config["hidden_size"]
-        # ===== 预训练任务头 =====
+
+        # ✅ 是否开启“生成式 finetune”
+        gen_flags = (
+            self.hparams.config["loss_names"].get("vqa_gen", 0) > 0
+            or self.hparams.config["loss_names"].get("nlvr2_gen", 0) > 0
+            or self.hparams.config["loss_names"].get("imgcls_gen", 0) > 0
+        )
+
+        # ----------------- 预训练任务头 -----------------
         if config["loss_names"]["mlm"] > 0:
             self.mlm_score = heads.MLMHead(bert_config)
             self.mlm_score.apply(objectives.init_weights)
@@ -63,13 +74,10 @@ class ViLTransformerSS(pl.LightningModule):
             self.mpp_score = heads.MPPHead(bert_config)
             self.mpp_score.apply(objectives.init_weights)
 
-        # === 新增：AR-LM 头 ===
-        if config["loss_names"].get("ar_lm", 0) > 0:
+        # === LM 头：用于 AR 预训练 或 任意生成式 finetune（关键改动）===
+        if config["loss_names"].get("ar_lm", 0) > 0 or gen_flags:
             tie = self.hparams.config.get("tie_lm_head", True)
-            weight = (
-                self.text_embeddings.word_embeddings.weight
-                if tie else None
-            )
+            weight = self.text_embeddings.word_embeddings.weight if tie else None
             self.lm_score = heads.LMHead(
                 hidden_size=config["hidden_size"],
                 vocab_size=config["vocab_size"],
@@ -78,31 +86,34 @@ class ViLTransformerSS(pl.LightningModule):
             )
             if not tie:
                 self.lm_score.apply(objectives.init_weights)
-        # === ITC 投影与温度（新增） ===
+
+        # === ITC 投影与温度（CLIP式对比对齐）===
         if self.hparams.config["loss_names"].get("itc", 0) > 0:
             proj_dim = int(self.hparams.config.get("proj_dim", hs))
             ratio = self.hparams.config.get("proj_mlp_ratio", 1.0)
             drop = self.hparams.config.get("proj_dropout", 0.0)
-            self.text_proj  = heads.ProjectionHead(hs, proj_dim, hidden_dim=int(hs*ratio), dropout=drop)
-            self.image_proj = heads.ProjectionHead(hs, proj_dim, hidden_dim=int(hs*ratio), dropout=drop)
+            self.text_proj  = heads.ProjectionHead(hs, proj_dim, hidden_dim=int(hs * ratio), dropout=drop)
+            self.image_proj = heads.ProjectionHead(hs, proj_dim, hidden_dim=int(hs * ratio), dropout=drop)
 
             self.text_proj.apply(objectives.init_weights)
             self.image_proj.apply(objectives.init_weights)
-            # CLIP风格的可学习温度（logit_scale存的是log温度）
-            import math, torch
-            init = float(self.hparams.config.get("logit_scale_init", 1/0.07))
+
+            init = float(self.hparams.config.get("logit_scale_init", 1 / 0.07))
             self.logit_scale = nn.Parameter(torch.log(torch.tensor(init)))
 
-        # ===================== Downstream ===================== #
-        if (
-            self.hparams.config["load_path"] != ""
-            and not self.hparams.config["test_only"]
-        ):
+        # ----------------- 加载预训练权重（如有） -----------------
+        if self.hparams.config["load_path"] != "" and self.hparams.config["test_only"]:
             ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu", weights_only=False)
             state_dict = ckpt["state_dict"]
+            self._patch_state_dict_for_bert_pos(state_dict)
             self.load_state_dict(state_dict, strict=False)
+            
+        # ✅ 若为“生成式 finetune”，确保已经构建 LMHead；并避免再构建分类头
+        if gen_flags:
+            assert hasattr(self, "lm_score"), "生成式微调需要 LMHead（已在预训练或此处创建）"
 
-        if self.hparams.config["loss_names"]["vqa"] > 0:
+        # ----------------- 下游分类头（仅在非生成式 finetune 时启用） -----------------
+        if (self.hparams.config["loss_names"].get("vqa", 0) > 0) and (not gen_flags):
             vs = self.hparams.config["vqav2_label_size"]
             self.vqa_classifier = nn.Sequential(
                 nn.Linear(hs, hs * 2),
@@ -112,7 +123,7 @@ class ViLTransformerSS(pl.LightningModule):
             )
             self.vqa_classifier.apply(objectives.init_weights)
 
-        if self.hparams.config["loss_names"]["nlvr2"] > 0:
+        if (self.hparams.config["loss_names"].get("nlvr2", 0) > 0) and (not gen_flags):
             self.nlvr2_classifier = nn.Sequential(
                 nn.Linear(hs * 2, hs * 2),
                 nn.LayerNorm(hs * 2),
@@ -120,6 +131,7 @@ class ViLTransformerSS(pl.LightningModule):
                 nn.Linear(hs * 2, 2),
             )
             self.nlvr2_classifier.apply(objectives.init_weights)
+            # NLVR2 双图：token_type_embeddings 扩到 3
             emb_data = self.token_type_embeddings.weight.data
             self.token_type_embeddings = nn.Embedding(3, hs)
             self.token_type_embeddings.apply(objectives.init_weights)
@@ -127,9 +139,9 @@ class ViLTransformerSS(pl.LightningModule):
             self.token_type_embeddings.weight.data[1, :] = emb_data[1, :]
             self.token_type_embeddings.weight.data[2, :] = emb_data[1, :]
 
+        # ----------------- IRTR 排序头（保持不变） -----------------
         if self.hparams.config["loss_names"]["irtr"] > 0:
             self.rank_output = nn.Linear(hs, 1)
-            # 可能不再有 itm_score，因此要做防御
             if hasattr(self, "itm_score"):
                 self.rank_output.weight.data = self.itm_score.fc.weight.data[1:, :]
                 self.rank_output.bias.data = self.itm_score.fc.bias.data[1:]
@@ -137,10 +149,9 @@ class ViLTransformerSS(pl.LightningModule):
                     p.requires_grad = False
             self.margin = 0.2
 
+        # ----------------- 指标、任务集与测试加载 -----------------
         vilt_utils.set_metrics(self)
         self.current_tasks = list()
-
-        # ===================== load downstream (test_only) ======================
 
         if self.hparams.config["load_path"] != "" and self.hparams.config["test_only"]:
             ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu", weights_only=False)
@@ -284,6 +295,15 @@ class ViLTransformerSS(pl.LightningModule):
         if "irtr" in self.current_tasks:
             ret.update(objectives.compute_irtr(self, batch))
 
+            # === 生成式 finetune（新增） ===
+        if "vqa_gen" in self.current_tasks:
+            ret.update(objectives.compute_vqa_gen(self, batch))
+        if "nlvr2_gen" in self.current_tasks:
+            ret.update(objectives.compute_nlvr2_gen(self, batch))
+        if "imgcls_gen" in self.current_tasks:
+            ret.update(objectives.compute_imgcls_gen(self, batch))
+
+
         return ret
 
     def training_step(self, batch, batch_idx):
@@ -399,3 +419,40 @@ class ViLTransformerSS(pl.LightningModule):
             preview = ", ".join(names[:3]) + (" ..." if len(names) > 3 else "")
             summary_lines.append(f"  - {grp:<18} count={len(names):<5} e.g. {preview}")
         self._print_once("\n".join(summary_lines))
+
+
+    # === ViLTransformerSS 类内新增（放在 __init__ 前后任意位置，保持缩进为类内）===
+    def _resize_bert_pos_embed(self, old_weight: torch.Tensor, new_num_pos: int) -> torch.Tensor:
+        """
+        把 [old_len, H] 的位置表插值到 [new_len, H]；用于从 max_text_len=40 → 256。
+        """
+        old_len, hid = old_weight.shape
+        if old_len == new_num_pos:
+            return old_weight
+        # [1, H, old_len] -> interpolate -> [1, H, new_len] -> [new_len, H]
+        w = old_weight.detach().unsqueeze(0).transpose(1, 2)             # [1, old_len, H] 之前写反了，这里修正
+        w = torch.nn.functional.interpolate(w, size=new_num_pos, mode="linear", align_corners=True)
+        w = w.transpose(1, 2).squeeze(0)                                 # [new_len, H]
+        return w
+
+    def _patch_state_dict_for_bert_pos(self, state_dict: dict):
+        """
+        处理 BERT 的 position_embeddings/position_ids 维度不匹配：
+        - 若位置表长度不同：做线性插值
+        - 对 position_ids（buffer）维度不匹配：直接删掉，让当前模型用自己的 buffer
+        """
+        pe_key  = "text_embeddings.position_embeddings.weight"
+        pid_key = "text_embeddings.position_ids"
+
+        if pe_key in state_dict:
+            old_pe = state_dict[pe_key]
+            new_pe = self.text_embeddings.position_embeddings.weight
+            if tuple(old_pe.shape) != tuple(new_pe.shape):
+                new_len = new_pe.shape[0]
+                state_dict[pe_key] = self._resize_bert_pos_embed(old_pe, new_len)
+
+        # position_ids 是 buffer；shape 不同直接删，使用当前模型里构造好的
+        if pid_key in state_dict:
+            if tuple(state_dict[pid_key].shape) != tuple(self.text_embeddings.position_ids.shape):
+                state_dict.pop(pid_key)
+

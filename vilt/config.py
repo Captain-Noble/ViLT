@@ -12,11 +12,14 @@ def _loss_names(d):
         "nlvr2": 0,
         "irtr": 0,
         "ar_lm": 0,
-        "itc": 0,              # ← 新增：CLIP式对比对齐
+        "itc": 0,               # 新：CLIP式对比对齐
+        # 生成式 fine-tune 任务（新）
+        "vqa_gen": 0,
+        "nlvr2_gen": 0,
+        "imgcls_gen": 0,
     }
     ret.update(d)
     return ret
-
 
 
 @ex.config
@@ -90,38 +93,40 @@ def config():
     ar_causal_mask = True     # 是否使用因果注意力
     use_bos_eos = True        # 文本是否加 BOS/EOS（用 BERT 的 [CLS]/[SEP] 也可）
     tie_lm_head = True        # 是否与词嵌入权重 tying
-    # ============================
+
+    # Dataloader 限制
     limit_train_batches = 1.0   # float: 比例(0~1); int: 批次数
     limit_val_batches   = 1.0
     limit_test_batches  = 1.0
 
 
+# —— 原有 named_config 保持 —— #
 
-# Named configs for "task" which define datasets, loss_names and desired batch_size, warmup_steps, epochs, and exp_name
 @ex.named_config
 def task_mlm_itm():
     exp_name = "mlm_itm"
-    # datasets = ["coco", "vg", "sbu", "gcc"]
     datasets = ["coco", "vg"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
     batch_size = 4096
     max_epoch = 10
     max_image_len = 200
 
+
 @ex.named_config
 def task_ar_lm_itm():
     exp_name = "ar_lm_itm"
     datasets = ["coco", "vg"]
-    loss_names = _loss_names({"ar_lm": 1, "itm": 1})  # ← 用 AR-LM 替代 MLM
+    loss_names = _loss_names({"ar_lm": 1, "itm": 1})
     batch_size = 4096
     max_epoch = 10
     max_image_len = 200
+
 
 @ex.named_config
 def task_ar_lm_itc():
     exp_name = "ar_lm_itc"
     datasets = ["coco", "vg"]
-    loss_names = _loss_names({"ar_lm": 1, "itc": 1})  # ← ITC 取代 ITM
+    loss_names = _loss_names({"ar_lm": 1, "itc": 1})
     batch_size = 4096
     max_epoch = 10
     max_image_len = 200
@@ -130,7 +135,6 @@ def task_ar_lm_itc():
 @ex.named_config
 def task_mlm_itm_randaug():
     exp_name = "mlm_itm_randaug"
-    # datasets = ["coco", "vg", "sbu", "gcc"]
     datasets = ["coco", "vg"]
     train_transform_keys = ["pixelbert_randaug"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
@@ -149,6 +153,7 @@ def task_mlm_itm_mpp():
     max_image_len = 200
 
 
+# —— 原有 finetune（分类版）保留 —— #
 @ex.named_config
 def task_finetune_nlvr2():
     exp_name = "finetune_nlvr2"
@@ -207,95 +212,61 @@ def task_finetune_vqa_randaug():
     lr_mult = 10
 
 
+# —— 新增：生成式 finetune —— #
 @ex.named_config
-def task_finetune_irtr_coco():
-    exp_name = "finetune_irtr_coco"
-    datasets = ["coco"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
+def task_gen_vqa():
+    exp_name = "gen_vqa"
+    datasets = ["vqa"]
+    loss_names = _loss_names({"vqa_gen": 1})
     batch_size = 256
     max_epoch = 10
     max_steps = None
     warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
+    draw_false_image = 0
     learning_rate = 1e-4
+    val_check_interval = 0.1
+    lr_mult = 10
 
 
 @ex.named_config
-def task_finetune_irtr_coco_randaug():
-    exp_name = "finetune_irtr_coco_randaug"
-    datasets = ["coco"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
+def task_gen_nlvr2():
+    exp_name = "gen_nlvr2"
+    datasets = ["nlvr2"]
+    loss_names = _loss_names({"nlvr2_gen": 1})
+    batch_size = 128
     max_epoch = 10
     max_steps = None
     warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
+    draw_false_image = 0
     learning_rate = 1e-4
+    max_text_len = 256
 
 
-@ex.named_config
-def task_finetune_irtr_f30k():
-    exp_name = "finetune_irtr_f30k"
-    datasets = ["f30k"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-
-
-@ex.named_config
-def task_finetune_irtr_f30k_randaug():
-    exp_name = "finetune_irtr_f30k_randaug"
-    datasets = ["f30k"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-
-
-# Named configs for "etc" which are orthogonal to "env" and "task", need to be added at the end
-
+# —— 其它保持不变 —— #
 @ex.named_config
 def steptest():
     max_epoch = 100
     max_steps = 100
-
 
 @ex.named_config
 def step25k():
     max_epoch = 100
     max_steps = 25000
 
-
 @ex.named_config
 def step50k():
     max_epoch = 100
     max_steps = 50000
-
 
 @ex.named_config
 def step100k():
     max_epoch = 100
     max_steps = 100000
 
-
 @ex.named_config
 def step200k():
     max_epoch = 200
     max_steps = 200000
-
 
 @ex.named_config
 def vit32_base():
@@ -304,5 +275,3 @@ def vit32_base():
     hidden_size = 768
     num_heads = 12
     num_layers = 12
-
-
